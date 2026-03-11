@@ -1,0 +1,23 @@
+# Hibiki Discord - Example Configuration
+#
+# This file defines your Discord notification types. Each notification type
+# maps to a Discord webhook via an environment variable name.
+#
+# The webhook URLs themselves are stored in environment variables (not in this file),
+# so this file is safe to commit to version control.
+
+[notifications.user_signup]
+webhook_url_env = "SIGNUP_DISCORD_WEBHOOK_URL"
+username = "Signup Bot"
+message_template = "New user signed up: {email}"
+
+[notifications.subscription]
+webhook_url_env = "SUBSCRIPTION_DISCORD_WEBHOOK_URL"
+username = "Billing Bot"
+message_template = "New subscription: {plan} by {email}"
+
+[notifications.deployment]
+webhook_url_env = "DEPLOYMENT_DISCORD_WEBHOOK_URL"
+username = "Deploy Bot"
+message_template = "{service} deployed to {environment} (v{version})"
+enabled = false

@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hibiki-discord"
+dynamic = ["version"]
+description = "Lean Discord notification service for business events"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Matt"}
+]
+keywords = ["discord", "webhook", "notifications", "async", "aiohttp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Topic :: Communications :: Chat",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+    "Framework :: AsyncIO",
+]
+dependencies = [
+    "aiohttp>=3.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "black>=23.0",
+    "flake8>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/mateeyas/hibiki-discord"
+Repository = "https://github.com/mateeyas/hibiki-discord"
+Issues = "https://github.com/mateeyas/hibiki-discord/issues"
+Changelog = "https://github.com/mateeyas/hibiki-discord/blob/main/CHANGELOG.md"
+
+[tool.setuptools.dynamic]
+version = {attr = "hibiki_discord.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["hibiki_discord*"]
+
+[tool.setuptools.package-data]
+hibiki_discord = ["py.typed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
