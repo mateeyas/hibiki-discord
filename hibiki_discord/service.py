@@ -12,9 +12,13 @@ def anonymize_email(email: str) -> str:
     """
     Anonymize an email address while keeping it identifiable.
 
+    The local part is always replaced with its first character followed by
+    three asterisks, regardless of length or punctuation.
+
     Examples:
-        john.doe@example.com -> j***.d***@example.com
+        john.doe@example.com -> j***@example.com
         user@domain.com -> u***@domain.com
+        a.b@test.com -> a***@test.com
     """
     if not email or "@" not in email:
         return email
@@ -22,22 +26,10 @@ def anonymize_email(email: str) -> str:
     try:
         local_part, domain = email.split("@", 1)
 
-        if "." in local_part:
-            parts = local_part.split(".")
-            anonymized_parts = []
-            for part in parts:
-                if len(part) > 1:
-                    anonymized_parts.append(f"{part[0]}***")
-                else:
-                    anonymized_parts.append(part)
-            anonymized_local = ".".join(anonymized_parts)
-        else:
-            if len(local_part) > 1:
-                anonymized_local = f"{local_part[0]}***"
-            else:
-                anonymized_local = local_part
+        if not local_part:
+            return email
 
-        return f"{anonymized_local}@{domain}"
+        return f"{local_part[0]}***@{domain}"
 
     except Exception:
         return email

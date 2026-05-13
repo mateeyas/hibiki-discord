@@ -17,10 +17,10 @@ class TestAnonymizeEmail:
         assert anonymize_email("user@domain.com") == "u***@domain.com"
 
     def test_dotted_email(self):
-        assert anonymize_email("john.doe@example.com") == "j***.d***@example.com"
+        assert anonymize_email("john.doe@example.com") == "j***@example.com"
 
     def test_single_char_parts(self):
-        assert anonymize_email("a.b@test.com") == "a.b@test.com"
+        assert anonymize_email("a.b@test.com") == "a***@test.com"
 
     def test_empty_string(self):
         assert anonymize_email("") == ""
@@ -33,7 +33,10 @@ class TestAnonymizeEmail:
 
     def test_triple_dotted(self):
         result = anonymize_email("first.middle.last@co.uk")
-        assert result == "f***.m***.l***@co.uk"
+        assert result == "f***@co.uk"
+
+    def test_single_char_local(self):
+        assert anonymize_email("a@b.com") == "a***@b.com"
 
 
 class TestSend:

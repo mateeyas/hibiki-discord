@@ -12,7 +12,7 @@ Usage:
     await send_notification("user_signup", email="user@example.com")
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 from .config import load_config, get_notification_config
 from .service import send_notification, send, fire_notification
