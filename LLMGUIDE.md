@@ -51,9 +51,13 @@ SUBSCRIPTION_DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 - MUST call `load_config()` or `load_config_from_dict()` before calling `send_notification` or `fire_notification`.
 - TOML config stores env var **names**, never actual webhook URLs. Webhook URLs go in environment variables only.
 - `message_template` uses Python `str.format()` syntax. Every `{placeholder}` in the template must be supplied as a keyword argument to `send_notification` / `fire_notification`.
-- Any keyword argument with `"email"` in its key name (case-insensitive) is automatically anonymized before sending (e.g. `john.doe@example.com` → `j***.d***@example.com`). This applies to `send_notification` and `fire_notification`, NOT to the low-level `send`.
+- Any keyword argument with `"email"` in its key name (case-insensitive) is automatically anonymized before sending (e.g. `john.doe@example.com` → `j***@example.com`). This applies to `send_notification` and `fire_notification`, NOT to the low-level `send`.
 - `fire_notification` is the only non-coroutine. It calls `asyncio.create_task` internally, so an event loop must be running.
-- Do NOT use the low-level `send()` for normal notifications. Use `send_notification` or `fire_notification` instead. `send()` bypasses config, templates, and anonymization.
+- Do NOT use the low-level `send()` for normal notifications. Use `send_notification` or `fire_notification` instead. `send()` bypasses config, templates, anonymization, and throttling.
+- A send that fails or is cancelled does not open a dedup window, and occurrences collapsed into it while it was in flight are carried to the next send, so a webhook outage cannot silence a notification.
+- Sends are capped at `max_per_minute` per webhook URL (default 30, sliding 60 second window). Messages beyond the cap are dropped, counted, and the count is reported in the next successful send. Nothing is queued; there is no worker to start or stop.
+- Deduplication is OFF by default (`dedup_window = 0`). Enable it per notification type only where a repeated message is genuinely a repeat. Anonymization renders distinct emails identically (`alice@x.com` and `amir@x.com` both become `a***@x.com`), so dedup collapses distinct customers.
+- Plain text is the default rendering. Embeds are opt-in per notification type with `embed = true`.
 
 ## API reference
 
@@ -69,16 +73,16 @@ Loads config from TOML. Call once at startup.
 Sends a configured notification to Discord.
 
 - Returns `True` on success.
-- Returns `False` silently if notification is disabled (`enabled = false`) or webhook env var is unset.
+- Returns `False` silently if notification is disabled (`enabled = false`), the webhook env var is unset, or the message was collapsed by dedup / shed by the send budget.
 - Raises `ValueError` if: type is unknown, template is missing, or a template variable is missing.
 
 ### `fire_notification(notification_type: str, **template_vars) -> asyncio.Task[bool]` — sync
 
 Fire-and-forget wrapper around `send_notification`. Returns an `asyncio.Task`. Errors are logged, not raised. The task can be awaited if you need the result, or ignored.
 
-### `send(webhook_url: str, message: str, username=None) -> bool` — async
+### `send(webhook_url: str, message=None, username=None, embed=None) -> bool` — async
 
-Low-level: POSTs a message directly to a webhook URL. No config, no templates, no anonymization. Returns `True` on HTTP 204.
+Low-level: POSTs a message directly to a webhook URL. No config, no templates, no anonymization, no throttling. Returns `True` on HTTP 200 or 204. Retries on 429 and 5xx, honouring Discord's `Retry-After` with exponential backoff (4 attempts, 30 second cap). At least one of `message` or `embed` is required.
 
 ### `get_notification_config(notification_type: str) -> NotificationConfig | None`
 
@@ -92,6 +96,21 @@ Each notification is a `[notifications.<name>]` block:
 - `message_template` (str, required for send_notification): Python `str.format()` template.
 - `username` (str, optional): display name for the webhook bot in Discord.
 - `enabled` (bool, optional, default `true`): set to `false` to disable without removing.
+- `embed` (bool, optional, default `false`): render as a Discord embed.
+- `embed_title` (str, optional): embed title.
+- `embed_color` (str or int, optional, default Discord blurple): `"#5865F2"` or an integer.
+- `dedup_window` (int, optional, default `0`): seconds identical messages collapse into one send; `0` disables.
+- `max_per_minute` (int, optional, default `30`, minimum `1`): sends allowed to this webhook per 60 seconds.
+
+`enabled` and `embed` must be real TOML booleans, not quoted strings: a quoted `"false"` is truthy and would leave the type enabled. Invalid `enabled`, `embed`, `dedup_window`, `max_per_minute`, or `embed_color` values raise `ValueError` at load time.
+
+## Environment variables
+
+- `HIBIKI_DISCORD_CONFIG`: path to the TOML config file.
+- `HIBIKI_DISCORD_DEDUP_WINDOW` (default `0`): default `dedup_window` for all types.
+- `HIBIKI_DISCORD_MAX_PER_MINUTE` (default `30`): default `max_per_minute` for all types.
+
+Per-notification TOML keys take precedence over these.
 
 ## Programmatic config (no TOML file)
 
@@ -121,14 +140,25 @@ Same key schema as the TOML format.
 | Webhook env var not set | Returns `False`, logs warning | Returns `False` via task, logs warning |
 | Notification disabled | Returns `False` silently | Returns `False` via task silently |
 | HTTP error from Discord | Returns `False`, logs error | Returns `False` via task, logs error |
+| Rate limited (429) or 5xx | Retries with backoff, then `False` | Same, via task |
+| Collapsed by dedup or shed by budget | Returns `False`, count reported in a later send | Same, via task |
 
 ## Test utilities
 
 Available from `hibiki_discord.config` (not re-exported):
 
-- `reset()`: clears all loaded configs. Call in test teardown.
+- `reset()`: clears all loaded configs and throttle state. Call in test teardown, otherwise one test's sends throttle the next one's.
 - `get_all_configs() -> dict`: returns all loaded configs.
 - `load_config_from_dict(...)`: configure without a TOML file (see above).
+
+## Throttling and embeds
+
+Implemented independently in
+[hibiki-logger](https://github.com/mateeyas/hibiki-logger) with the same
+behaviour and config names; the two share no code. `hibiki_discord.throttle`
+holds the dedup and rate-limit state (a dict of windows plus a list of send
+timestamps per webhook, checked synchronously on the send path).
+`hibiki_discord.embeds` builds embeds within Discord's limits and never raises.
 
 ## Logging
 

@@ -21,3 +21,19 @@ webhook_url_env = "DEPLOYMENT_DISCORD_WEBHOOK_URL"
 username = "Deploy Bot"
 message_template = "{service} deployed to {environment} (v{version})"
 enabled = false
+
+# Optional per-notification overrides:
+#
+#   embed          = true      # render as a Discord embed (default: plain text)
+#   embed_title    = "Signup"  # embed title
+#   embed_color    = "#5865F2" # embed colour, hex string or integer
+#   dedup_window   = 300       # seconds identical messages collapse (default: 0, off)
+#   max_per_minute = 30        # webhook sends per 60 seconds (default: 30)
+#
+# [notifications.incident]
+# webhook_url_env = "INCIDENT_DISCORD_WEBHOOK_URL"
+# username = "Incident Bot"
+# message_template = "Payment processor unreachable"
+# embed = true
+# embed_color = "#DC2626"
+# dedup_window = 300
