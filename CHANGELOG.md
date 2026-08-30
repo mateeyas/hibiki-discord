@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.0] - 2026-08-30
+## [2.0.0] - 2026-08-30
 
 ### Added
 
@@ -27,22 +27,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `send()` accepts an `embed` argument and treats HTTP `200` as success
   alongside `204`.
 
-### Fixed
-
-- `LLMGUIDE.md` no longer documents the pre-1.0.1 `j***.d***@example.com`
-  anonymization form.
-
 ### Changed
 
-- `load_config()` and `load_config_from_dict()` now validate `dedup_window`,
-  `max_per_minute`, and `embed_color`, raising `ValueError` at load time rather
-  than failing at send time. Loading config also clears throttle state.
 - **Breaking:** `enabled` and `embed` must be real TOML booleans. A quoted
   `enabled = "false"` is a truthy string, so it previously left a notification
   type firing that the operator believed was switched off; it now raises
   `ValueError` at load time. Configs using quoted booleans — including a
   working `enabled = "true"` — need the quotes removed before upgrading. Check
-  with `grep -n 'enabled\|embed' your-config.toml`.
+  with `grep -n 'enabled\|embed' your-config.toml`. This is the only
+  backwards-incompatible change in this release; everything else works
+  unchanged on existing configs and defaults.
+- `load_config()` and `load_config_from_dict()` now validate `dedup_window`,
+  `max_per_minute`, and `embed_color`, raising `ValueError` at load time rather
+  than failing at send time. Loading config also clears throttle state.
+
+### Fixed
+
+- `LLMGUIDE.md` no longer documents the pre-1.0.1 `j***.d***@example.com`
+  anonymization form.
 
 ## [1.0.1] - 2026-05-13
 
