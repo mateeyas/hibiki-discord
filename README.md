@@ -121,8 +121,10 @@ as `a***@example.com`, so dedup would collapse two customers into one message.
 Turn it on for notification types where a repeat really is a repeat, such as an
 incident or health-check alert.
 
-A message that fails to send does not open a dedup window and does not consume
-its suppression counts, so a webhook outage cannot silence a notification.
+A message that fails to send — or is cancelled mid-send, by a timeout or at
+shutdown — does not open a dedup window and does not consume its suppression
+counts, and occurrences collapsed into it while it was in flight are carried to
+the next message, so a webhook outage cannot silence a notification.
 
 > The same behaviour is implemented independently in
 > [hibiki-logger](https://github.com/mateeyas/hibiki-logger). The two share no

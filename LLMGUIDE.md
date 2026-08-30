@@ -54,6 +54,7 @@ SUBSCRIPTION_DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 - Any keyword argument with `"email"` in its key name (case-insensitive) is automatically anonymized before sending (e.g. `john.doe@example.com` → `j***@example.com`). This applies to `send_notification` and `fire_notification`, NOT to the low-level `send`.
 - `fire_notification` is the only non-coroutine. It calls `asyncio.create_task` internally, so an event loop must be running.
 - Do NOT use the low-level `send()` for normal notifications. Use `send_notification` or `fire_notification` instead. `send()` bypasses config, templates, anonymization, and throttling.
+- A send that fails or is cancelled does not open a dedup window, and occurrences collapsed into it while it was in flight are carried to the next send, so a webhook outage cannot silence a notification.
 - Sends are capped at `max_per_minute` per webhook URL (default 30, sliding 60 second window). Messages beyond the cap are dropped, counted, and the count is reported in the next successful send. Nothing is queued; there is no worker to start or stop.
 - Deduplication is OFF by default (`dedup_window = 0`). Enable it per notification type only where a repeated message is genuinely a repeat. Anonymization renders distinct emails identically (`alice@x.com` and `amir@x.com` both become `a***@x.com`), so dedup collapses distinct customers.
 - Plain text is the default rendering. Embeds are opt-in per notification type with `embed = true`.
