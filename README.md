@@ -157,6 +157,27 @@ the next message, so a webhook outage cannot silence a notification.
 > applying to the other. The defaults differ deliberately: hibiki-logger
 > deduplicates by traceback signature at 300 seconds, because a repeated log
 > record is the same fault firing again.
+>
+> As of 3.0.0 they have genuinely diverged: pacing, charging retries to the send
+> budget, and evicting dedup windows by what they still have to report are all
+> here and not there. Worth backporting.
+
+### Mentions
+
+Every payload sets `allowed_mentions: {"parse": []}`, so Discord does not
+resolve `@everyone`, `@here`, or role mentions in a message. Template values are
+caller-supplied and often user-controlled — a signup email, a display name, a
+free-text summary — and a value containing `@everyone` would otherwise ping the
+whole channel on every notification.
+
+This applies to mentions you put in a `message_template` deliberately, too:
+
+```toml
+message_template = "@here Payment processor unreachable"   # renders, does not ping
+```
+
+The text is unchanged and still renders as written; Discord is simply told not
+to resolve it. There is no config key to opt back in.
 
 ### Embeds
 
@@ -230,8 +251,16 @@ Get the config for a specific notification type, or `None` if not configured.
 **Fewer notifications than expected** — check `dedup_window` for the notification
 type. Identical messages collapse for that many seconds and are counted in the
 next message for that text. Messages shed by `max_per_minute` are counted the
-same way. Both counts appear in the message footer, so nothing disappears
-without a trace.
+same way. Both counts appear in the message footer, so a collapsed or shed
+message is still accounted for. The one exception is a webhook tracking more
+than 512 distinct dedup signatures at once, where the oldest counts are
+discarded to bound memory; that is logged as a warning naming how many were
+lost.
+
+**Notifications arrive late** — sends to one webhook are paced half a second
+apart, so a burst is spread rather than dropped and the last of thirty goes out
+about fifteen seconds after the first. `await send_notification(...)` waits its
+turn; `fire_notification` returns immediately and waits in the background.
 
 **Nothing arrives** — verify the webhook env var named by `webhook_url_env` is
 set at runtime and `enabled` is not `false`. Both cases return `False` and log,

@@ -62,6 +62,7 @@ SUBSCRIPTION_DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 - Sends to one webhook are spaced 0.5s apart, because the budget bounds the average over a minute while Discord's limit is on the instant. A burst is paced, not dropped, so `send_notification` can wait before sending — up to 60s on a saturated webhook, beyond which it is dropped and counted. Use `fire_notification` where the caller must not block.
 - Deduplication is OFF by default (`dedup_window = 0`). Enable it per notification type only where a repeated message is genuinely a repeat: two signups a second apart are two customers, not one message sent twice. Note that anonymized values collapse (`alice@x.com` and `amir@x.com` both become `a***@x.com`), so dedup on an anonymized template merges distinct customers.
 - Plain text is the default rendering. Embeds are opt-in per notification type with `embed = true`.
+- Every payload sets `allowed_mentions: {"parse": []}`, so `@everyone`, `@here` and role mentions never resolve — including ones written into a `message_template` deliberately. Template values are caller-supplied and often user-controlled, so a value containing `@everyone` would otherwise ping the whole channel. There is no opt-out; do NOT tell a user to add a config key for it.
 
 ## API reference
 
