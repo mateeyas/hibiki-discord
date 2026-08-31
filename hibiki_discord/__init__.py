@@ -10,12 +10,16 @@ Usage:
     load_config()  # reads hibiki-discord.toml
 
     await send_notification("user_signup", email="user@example.com")
+
+    # Opt in to anonymization explicitly:
+    # from hibiki_discord import anonymize_email
+    # await send_notification("user_signup", email=anonymize_email(addr))
 """
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 
 from .config import load_config, get_notification_config
-from .service import send_notification, send, fire_notification
+from .service import send_notification, send, fire_notification, anonymize_email
 
 __all__ = [
     "load_config",
@@ -23,4 +27,5 @@ __all__ = [
     "send_notification",
     "fire_notification",
     "send",
+    "anonymize_email",
 ]

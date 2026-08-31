@@ -1,7 +1,7 @@
 import asyncio
 import aiohttp
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 from .config import get_notification_config
 from .embeds import build_footer, build_notification_embed, truncate_end
@@ -23,6 +23,12 @@ _OK = "ok"
 _RETRY = "retry"
 _FAIL = "fail"
 
+# asyncio holds only a weak reference to a running task, so a task nobody
+# keeps can be garbage collected mid-flight and the notification silently
+# never sent. fire_notification hands the task back but documents that it
+# may be ignored, so the package keeps the reference itself.
+_pending_tasks: set = set()
+
 
 def anonymize_email(email: str) -> str:
     """
@@ -35,6 +41,11 @@ def anonymize_email(email: str) -> str:
         john.doe@example.com -> j***@example.com
         user@domain.com -> u***@domain.com
         a.b@test.com -> a***@test.com
+
+    This is never applied automatically. Call it on the values you want
+    redacted, at the call site:
+
+        send_notification("user_signup", email=anonymize_email(user.email))
     """
     if not email or "@" not in email:
         return email
@@ -134,6 +145,7 @@ async def send(
     message: Optional[str] = None,
     username: Optional[str] = None,
     embed: Optional[dict] = None,
+    on_attempts: Optional[Callable[[int], None]] = None,
 ) -> bool:
     """
     Send a message to a Discord webhook.
@@ -147,6 +159,9 @@ async def send(
         message: The message to send (optional when an embed is given)
         username: Optional display name for the webhook bot
         embed: Optional Discord embed object sent alongside the message
+        on_attempts: Called with the number of HTTP requests made, once the
+            send is done. A caller tracking a request budget uses it to
+            charge retries to that budget; see hibiki_discord.throttle.
 
     Returns:
         True if the message was sent successfully, False otherwise.
@@ -159,7 +174,12 @@ async def send(
         logger.warning("Discord message has neither content nor embed")
         return False
 
-    payload: dict = {}
+    payload: dict = {
+        # Template values are caller-supplied and often user-controlled, and
+        # Discord resolves mentions in webhook content: a value containing
+        # "@everyone" would otherwise ping the channel on every notification.
+        "allowed_mentions": {"parse": []},
+    }
     if message:
         payload["content"] = truncate_end(message, CONTENT_LIMIT)
     if embed:
@@ -167,34 +187,52 @@ async def send(
     if username:
         payload["username"] = username
 
-    for attempt in range(MAX_SEND_ATTEMPTS):
-        outcome, retry_after = await _attempt_send(webhook_url, payload)
+    requests_made = 0
+    try:
+        for attempt in range(MAX_SEND_ATTEMPTS):
+            outcome, retry_after = await _attempt_send(webhook_url, payload)
+            requests_made += 1
 
-        if outcome == _OK:
-            return True
-        if outcome == _FAIL:
-            return False
+            if outcome == _OK:
+                return True
+            if outcome == _FAIL:
+                return False
 
-        if attempt + 1 >= MAX_SEND_ATTEMPTS:
-            logger.error("Discord send failed and retries are exhausted")
-            return False
+            if attempt + 1 >= MAX_SEND_ATTEMPTS:
+                logger.error("Discord send failed and retries are exhausted")
+                return False
 
-        delay = _backoff_delay(attempt, retry_after)
-        if delay > MAX_BACKOFF_SECONDS:
-            # Retrying before Discord is ready would only deepen the limit.
-            logger.error(
-                "Discord asked to wait %.0fs, beyond the %.0fs cap; "
-                "dropping message",
-                delay,
-                MAX_BACKOFF_SECONDS,
-            )
-            return False
+            delay = _backoff_delay(attempt, retry_after)
+            if delay > MAX_BACKOFF_SECONDS:
+                # Retrying before Discord is ready would only deepen the limit.
+                logger.error(
+                    "Discord asked to wait %.0fs, beyond the %.0fs cap; "
+                    "dropping message",
+                    delay,
+                    MAX_BACKOFF_SECONDS,
+                )
+                return False
 
-        logger.warning("Discord send failed; retrying in %.2fs", delay)
-        # Outside the session context, so nothing is held open while waiting.
-        await asyncio.sleep(delay)
+            logger.warning("Discord send failed; retrying in %.2fs", delay)
+            # Outside the session context, so nothing is held open while waiting.
+            await asyncio.sleep(delay)
 
-    return False
+        return False
+    finally:
+        # In `finally` so a cancelled send still charges the requests it
+        # already made.
+        if on_attempts is not None:
+            on_attempts(requests_made)
+
+
+async def _pace(seconds: float) -> None:
+    """Wait out a throttle pacing delay.
+
+    Its own function so tests can neutralize the wait without patching
+    ``asyncio.sleep``, which is process-wide and takes the event loop's own
+    machinery with it.
+    """
+    await asyncio.sleep(seconds)
 
 
 def _with_footer(message: str, suppressed_count: int, dropped_count: int) -> str:
@@ -227,12 +265,18 @@ async def send_notification(
     environment, formats the message template with the provided variables,
     and sends to Discord.
 
-    Email values in template_vars are automatically anonymized.
+    Values are sent as given -- nothing is redacted automatically. Wrap any
+    value you want anonymized in `anonymize_email`.
 
     Identical notifications are deduplicated and sends are capped by a per
     webhook budget; see hibiki_discord.throttle. A notification collapsed
     or shed by the throttle returns False without sending, and is reported
     as a count on a later send.
+
+    A send inside the budget that arrives while others are going out is
+    paced rather than dropped, so this can wait before sending -- up to a
+    minute on a saturated webhook. Use fire_notification where the caller
+    must not wait.
 
     Args:
         notification_type: The notification type name (must match a key in the config).
@@ -266,13 +310,8 @@ async def send_notification(
             f"Notification '{notification_type}' has no message_template"
         )
 
-    sanitized_vars = dict(template_vars)
-    for key, value in sanitized_vars.items():
-        if "email" in key.lower() and isinstance(value, str):
-            sanitized_vars[key] = anonymize_email(value)
-
     try:
-        message = config.message_template.format(**sanitized_vars)
+        message = config.message_template.format(**template_vars)
     except KeyError as e:
         raise ValueError(
             f"Missing template variable {e} for notification '{notification_type}'"
@@ -293,12 +332,25 @@ async def send_notification(
         return False
 
     try:
+        if decision.delay:
+            # Sends that would otherwise leave together are spaced out, so
+            # a batch loop does not arrive as one burst. Inside the try, so
+            # a wait cancelled at shutdown rolls the dedup window back like
+            # any other undelivered send.
+            logger.debug(
+                "Pacing notification '%s' by %.2fs",
+                notification_type,
+                decision.delay,
+            )
+            await _pace(decision.delay)
+
         delivered = await _deliver(
             config=config,
             message=message,
             webhook_url=webhook_url,
             suppressed_count=decision.suppressed,
             dropped_count=decision.dropped,
+            on_attempts=lambda n: throttle.record_retries(webhook_url, n - 1),
         )
     except BaseException:
         # BaseException so cancellation is covered too: a send cancelled
@@ -321,6 +373,7 @@ async def _deliver(
     webhook_url: str,
     suppressed_count: int = 0,
     dropped_count: int = 0,
+    on_attempts: Optional[Callable[[int], None]] = None,
 ) -> bool:
     """Render a notification and hand it to the webhook.
 
@@ -346,12 +399,14 @@ async def _deliver(
                 webhook_url=webhook_url,
                 username=config.username,
                 embed=embed,
+                on_attempts=on_attempts,
             )
 
     return await send(
         webhook_url=webhook_url,
         message=_with_footer(message, suppressed_count, dropped_count),
         username=config.username,
+        on_attempts=on_attempts,
     )
 
 
@@ -363,8 +418,10 @@ def fire_notification(
     Send a notification as a background task (fire-and-forget).
 
     Schedules send_notification on the running event loop and returns
-    immediately. The returned Task can be awaited or ignored. Errors are
-    logged rather than raised to the caller.
+    immediately. The returned Task can be awaited or ignored -- the package
+    holds its own reference until the send finishes, so an ignored task is
+    not collected mid-flight. Errors are logged rather than raised to the
+    caller.
 
     Args:
         notification_type: The notification type name (must match a key in the config).
@@ -383,4 +440,7 @@ def fire_notification(
             )
             return False
 
-    return asyncio.create_task(_wrapper())
+    task = asyncio.create_task(_wrapper())
+    _pending_tasks.add(task)
+    task.add_done_callback(_pending_tasks.discard)
+    return task

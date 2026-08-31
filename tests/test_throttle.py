@@ -1,5 +1,9 @@
+import logging
+
 from hibiki_discord.throttle import (
+    MAX_PACING_DELAY_SECONDS,
     MAX_TRACKED_SIGNATURES,
+    MIN_SEND_SPACING_SECONDS,
     DiscordThrottle,
     signature,
 )
@@ -220,10 +224,79 @@ class TestStateGrowth:
         """A pathological spread of distinct messages must not grow forever."""
         clock = FakeClock()
         throttle = make_throttle(clock)
+        sent = 0
         for i in range(5000):
-            check(throttle, message=f"user {i}", max_per_minute=10_000)
-            clock.advance(0.001)
+            # Advance past the pacing interval so every check is granted;
+            # otherwise this sheds on pacing and never reaches the cap.
+            if check(throttle, message=f"user {i}", max_per_minute=10_000).send:
+                sent += 1
+            clock.advance(MIN_SEND_SPACING_SECONDS)
+        assert sent == 5000
         assert len(throttle._windows) <= MAX_TRACKED_SIGNATURES
+
+    def test_expiry_still_runs_once_the_table_is_full(self):
+        """At the cap the table used to pin there, never reclaiming anything.
+
+        The expiry pass was skipped once full, so an expired, empty window
+        was never collected and every send evicted a live one to make room.
+        """
+        clock = FakeClock()
+        throttle = make_throttle(clock)
+        for i in range(MAX_TRACKED_SIGNATURES + 100):
+            check(throttle, message=f"user {i}", dedup_window=3600,
+                  max_per_minute=10_000)
+            clock.advance(MIN_SEND_SPACING_SECONDS)
+
+        # The sweep leaves room for the window each send opens, so the
+        # table settles at the cap rather than one below it.
+        assert len(throttle._windows) == MAX_TRACKED_SIGNATURES
+
+        # Every window is now long expired and holds nothing to report.
+        clock.advance(3700)
+        check(throttle, message="fresh", dedup_window=3600, max_per_minute=10_000)
+
+        assert len(throttle._windows) == 1
+
+    def test_a_window_holding_a_count_outlives_clean_ones(self):
+        """Evicting the oldest first would drop the biggest counts first.
+
+        The oldest window is the long dedup window most likely to be
+        holding suppressed occurrences nobody has been told about yet.
+        """
+        clock = FakeClock()
+        throttle = make_throttle(clock)
+        check(throttle, message="important", dedup_window=3600)
+        for _ in range(5):
+            check(throttle, message="important", dedup_window=3600)
+        key = (WEBHOOK, signature("signup", "important"))
+        assert throttle._windows[key].suppressed == 5
+
+        # Flood the table with distinct, newer signatures.
+        for i in range(MAX_TRACKED_SIGNATURES * 2):
+            clock.advance(MIN_SEND_SPACING_SECONDS)
+            check(throttle, message=f"noise {i}", dedup_window=3600,
+                  max_per_minute=10_000)
+
+        assert key in throttle._windows
+        assert throttle._windows[key].suppressed == 5
+
+    def test_dropping_a_count_is_logged(self, caplog):
+        """Losing a suppression note is invisible otherwise."""
+        clock = FakeClock()
+        throttle = make_throttle(clock)
+        # Every window holds a count, so the cap has nothing clean to take.
+        for i in range(MAX_TRACKED_SIGNATURES):
+            check(throttle, message=f"user {i}", dedup_window=3600,
+                  max_per_minute=10_000)
+            check(throttle, message=f"user {i}", dedup_window=3600,
+                  max_per_minute=10_000)
+            clock.advance(MIN_SEND_SPACING_SECONDS)
+
+        with caplog.at_level(logging.WARNING, logger="hibiki_discord"):
+            check(throttle, message="one more", dedup_window=3600,
+                  max_per_minute=10_000)
+
+        assert "will not be reported" in caplog.text
 
     def test_send_timestamps_stay_bounded(self):
         clock = FakeClock()
@@ -232,6 +305,73 @@ class TestStateGrowth:
             check(throttle, message=f"user {i}", max_per_minute=10)
             clock.advance(1)
         assert len(throttle._sends[WEBHOOK]) <= 10
+
+
+class TestPacing:
+    """The budget bounds the average; Discord's limit is on the instant."""
+
+    def test_sends_arriving_together_are_spaced(self):
+        throttle = make_throttle()
+        delays = [
+            check(throttle, message=f"user {i}", max_per_minute=30).delay
+            for i in range(4)
+        ]
+        assert delays == [0.0, 0.5, 1.0, 1.5]
+
+    def test_a_caller_that_waits_is_not_paced(self):
+        clock = FakeClock()
+        throttle = make_throttle(clock)
+        for _ in range(4):
+            assert check(throttle, message="hello", dedup_window=0).delay == 0.0
+            clock.advance(MIN_SEND_SPACING_SECONDS)
+
+    def test_pacing_past_the_cap_sheds_and_counts(self):
+        """Held longer than the budget window is worse than dropped."""
+        throttle = make_throttle()
+        granted = 0
+        for i in range(400):
+            if check(throttle, message=f"user {i}", max_per_minute=10_000).send:
+                granted += 1
+
+        assert granted == int(MAX_PACING_DELAY_SECONDS / MIN_SEND_SPACING_SECONDS) + 1
+        # The shed notifications are reported on the next send that lands.
+        assert throttle._dropped_pending[WEBHOOK] == 400 - granted
+
+
+class TestRetryAccounting:
+    def test_retries_consume_budget(self):
+        """One notification retried four times costs four slots, not one."""
+        throttle = make_throttle()
+        first = check(throttle, message="user 1", max_per_minute=4)
+        assert first.send is True
+        throttle.record_retries(WEBHOOK, 3)
+
+        assert check(throttle, message="user 2", max_per_minute=4).send is False
+
+    def test_a_clean_send_costs_one_slot(self):
+        throttle = make_throttle()
+        for i in range(4):
+            assert check(throttle, message=f"user {i}", max_per_minute=4).send is True
+            throttle.record_retries(WEBHOOK, 0)
+        assert check(throttle, message="fifth", max_per_minute=4).send is False
+
+    def test_charged_retries_expire_with_the_window(self):
+        clock = FakeClock()
+        throttle = make_throttle(clock)
+        check(throttle, message="user 1", max_per_minute=4)
+        throttle.record_retries(WEBHOOK, 3)
+
+        clock.advance(61)
+        assert check(throttle, message="user 2", max_per_minute=4).send is True
+
+    def test_retries_on_one_webhook_do_not_shed_another(self):
+        throttle = make_throttle()
+        check(throttle, message="user 1", max_per_minute=4)
+        throttle.record_retries(WEBHOOK, 3)
+
+        assert check(
+            throttle, message="user 2", webhook=OTHER_WEBHOOK, max_per_minute=4
+        ).send is True
 
 
 class TestReset:

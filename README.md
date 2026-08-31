@@ -38,7 +38,12 @@ message_template = "New {plan} subscription by {email}"
 **3. Send notifications:**
 
 ```python
-from hibiki_discord import load_config, send_notification, fire_notification
+from hibiki_discord import (
+    load_config,
+    send_notification,
+    fire_notification,
+    anonymize_email,
+)
 
 load_config()  # reads hibiki-discord.toml
 
@@ -49,7 +54,12 @@ await send_notification("user_signup", email="jane@example.com")
 fire_notification("subscription", plan="Pro", email="jane@example.com")
 ```
 
-Emails are automatically anonymized in messages (e.g. `j***@example.com`).
+Values are sent exactly as given. Nothing is redacted automatically — wrap the
+values you want anonymized:
+
+```python
+await send_notification("user_signup", email=anonymize_email(user.email))
+```
 
 ## Configuration
 
@@ -93,14 +103,15 @@ configuration changes.
 Discord rate limits webhooks at roughly 5 requests per 2 seconds and returns
 429 beyond that. Without throttling, a caller stuck in a retry loop exceeds the
 limit and loses notifications silently, because send failures are logged rather
-than raised. Three mechanisms run on the send path:
+than raised. Four mechanisms run on the send path:
 
 **Retries.** 429 and 5xx responses are retried, honouring Discord's
 `Retry-After` with exponential backoff. If Discord asks for a delay longer than
 30 seconds the message is dropped rather than retried early, since sending
 before the limit clears only extends it.
 
-**Send budget.** `max_per_minute` caps how many messages may go to one webhook
+**Send budget.** `max_per_minute` caps how many webhook *requests* may go to one
+webhook
 in any 60 second window. The budget is keyed on the webhook URL, because that is
 what Discord rate limits: notification types pointing at *different* webhooks
 cannot shed each other's messages, but types sharing one webhook share its
@@ -111,14 +122,28 @@ are dropped and counted, and the count is reported on the next successful send
 queued because queueing would need a background worker and its lifecycle. There
 is nothing to start or shut down.
 
+Retries count against the budget too. A send retried four times against a
+failing webhook spends four slots, not one, so a Discord incident cannot quietly
+multiply the request rate by four — which is the rate the budget exists to bound.
+
+**Pacing.** The budget bounds the average over a minute; Discord's limit is on
+the instant. Thirty sends fit a budget of thirty per minute whether they arrive
+spread out or all at once, and all at once is exactly what trips the limit. So
+sends to one webhook are spaced half a second apart: a batch loop firing
+`fire_notification` for every row is spread out rather than shed. This means
+`send_notification` can wait before sending — up to a minute on a saturated
+webhook — so use `fire_notification` where the caller must not block. Beyond a
+minute of pacing the notification is dropped and counted like any other
+over-budget send. Pacing is not queueing: each caller waits its own turn on its
+own task, and there is still nothing to start or drain.
+
 **Deduplication, off by default.** Set `dedup_window` and identical messages —
 same notification type, same rendered text — collapse into one send for that
 many seconds, with the number collapsed reported on the next send for that
 message ("142 further occurrences suppressed."). It is off by default because a
 repeated business notification is usually a second real event, not a repeat:
-email anonymization means `alice@example.com` and `amir@example.com` both render
-as `a***@example.com`, so dedup would collapse two customers into one message.
-Turn it on for notification types where a repeat really is a repeat, such as an
+two signups a second apart are two customers, not one message sent twice. Turn
+it on for notification types where a repeat really is a repeat, such as an
 incident or health-check alert.
 
 A message that fails to send — or is cancelled mid-send, by a timeout or at
@@ -182,13 +207,19 @@ Send a notification. Looks up the config, resolves the webhook URL from env, for
 
 ### `fire_notification(notification_type, **template_vars) -> asyncio.Task[bool]`
 
-Fire-and-forget variant of `send_notification`. Schedules the notification as a background task on the running event loop and returns immediately. Errors are logged instead of raised. The returned `asyncio.Task` can be awaited if you need the result, or simply ignored.
+Fire-and-forget variant of `send_notification`. Schedules the notification as a background task on the running event loop and returns immediately. Errors are logged instead of raised. The returned `asyncio.Task` can be awaited if you need the result, or simply ignored — the package keeps its own reference until the send finishes, so an ignored task is not garbage collected mid-flight.
 
-### `send(webhook_url, message=None, username=None, embed=None) -> bool`
+### `send(webhook_url, message=None, username=None, embed=None, on_attempts=None) -> bool`
 
 Low-level send. Posts a message directly to a Discord webhook URL, retrying on
-429 and 5xx responses. Bypasses config, templates, anonymization, and
-throttling.
+429 and 5xx responses. Bypasses config, templates, and throttling. `on_attempts`
+is called with the number of HTTP requests made once the send is done, for a
+caller tracking a request budget of its own.
+
+### `anonymize_email(email) -> str`
+
+`john.doe@example.com` → `j***@example.com`. Returns anything without an `@`, or
+with an empty local part, unchanged. Never applied automatically.
 
 ### `get_notification_config(notification_type) -> NotificationConfig | None`
 

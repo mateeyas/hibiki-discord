@@ -7,16 +7,26 @@ loop produces one webhook request per attempt, exceeds the limit, and
 loses notifications silently, because send failures are logged rather
 than raised.
 
-Two mechanisms, in order:
+Three mechanisms, in order:
 
 1. Deduplication collapses identical notifications inside a window.
 2. A send budget backstops the rest, for the case dedup cannot catch --
    distinct messages arriving in bulk.
+3. Pacing spaces out what survives, because the budget bounds the average
+   over a minute and Discord's limit is on the instant: thirty sends are
+   inside a budget of thirty per minute whether they arrive spread out or
+   all together, and all together is exactly what trips the limit.
 
 Notifications beyond the budget are dropped rather than queued, and the
 number dropped is reported on the next send. Queueing would buy
 completeness at the cost of a background worker and its lifecycle, which
-is more machinery than this package wants.
+is more machinery than this package wants. Pacing is not queueing: each
+caller waits for its own turn on its own task, and there is still nothing
+to start or drain.
+
+Every webhook request is charged to the budget, retries included. A send
+that is retried four times against a failing webhook costs four slots, not
+one, so an incident cannot quietly multiply the request rate by four.
 
 State is a dict and a list of timestamps per webhook, inspected
 synchronously on the existing send path. There is no background task to
@@ -43,6 +53,17 @@ MAX_TRACKED_SIGNATURES = 512
 
 _WINDOW_SECONDS = 60.0
 
+# Discord allows roughly 5 requests per 2 seconds. Half a second between
+# sends on one webhook stays under that with room for the retries that
+# share the same budget.
+MIN_SEND_SPACING_SECONDS = 0.5
+
+# How far ahead pacing will schedule before shedding instead. A caller
+# should not be held for longer than the budget window it is being paced
+# within; beyond this the notification is dropped and counted like any
+# other over-budget send.
+MAX_PACING_DELAY_SECONDS = _WINDOW_SECONDS
+
 
 class ThrottleDecision:
     """Outcome of a throttle check for one notification.
@@ -50,12 +71,27 @@ class ThrottleDecision:
     A decision to send reserves a dedup window and a budget slot. If the
     send then fails, pass the decision to ``record_failure`` so the window
     is released; see that method for why the budget slot is not.
+
+    ``delay`` is how long the caller must wait before making the request.
+    It is the caller's job to honour it -- the throttle never sleeps -- and
+    ignoring it gives back exactly the burst pacing exists to prevent.
     """
 
-    __slots__ = ("send", "suppressed", "dropped", "_key", "_previous_window")
+    __slots__ = (
+        "send", "suppressed", "dropped", "delay", "_key", "_previous_window"
+    )
 
-    def __init__(self, send: bool, suppressed: int = 0, dropped: int = 0):
+    def __init__(
+        self,
+        send: bool,
+        suppressed: int = 0,
+        dropped: int = 0,
+        delay: float = 0.0,
+    ):
         self.send = send
+        # Seconds to wait before the request, so sends that would leave
+        # together are spaced instead.
+        self.delay = delay
         # Occurrences of this signature collapsed since it was last sent.
         self.suppressed = suppressed
         # Notifications discarded for exceeding the send budget since the
@@ -67,7 +103,7 @@ class ThrottleDecision:
     def __repr__(self) -> str:
         return (
             f"ThrottleDecision(send={self.send}, suppressed={self.suppressed}, "
-            f"dropped={self.dropped})"
+            f"dropped={self.dropped}, delay={self.delay:.2f})"
         )
 
 
@@ -143,13 +179,25 @@ class DiscordThrottle:
             )
             return ThrottleDecision(False)
 
+        scheduled = self._next_slot(webhook_url, now)
+        if scheduled - now > MAX_PACING_DELAY_SECONDS:
+            # The paced queue on this webhook is already a minute deep.
+            # Holding the caller longer than the budget window it is being
+            # paced within is worse than shedding, so shed and count it.
+            self._dropped_pending[webhook_url] = (
+                self._dropped_pending.get(webhook_url, 0) + 1
+            )
+            return ThrottleDecision(False)
+
         self._sweep(now)
         self._windows[key] = _Window(now, dedup_window)
-        self._sends.setdefault(webhook_url, []).append(now)
+        self._sends.setdefault(webhook_url, []).append(scheduled)
 
         dropped = self._dropped_pending.pop(webhook_url, 0)
 
-        decision = ThrottleDecision(True, suppressed=pending, dropped=dropped)
+        decision = ThrottleDecision(
+            True, suppressed=pending, dropped=dropped, delay=scheduled - now
+        )
         decision._key = key
         decision._previous_window = window
         return decision
@@ -196,14 +244,48 @@ class DiscordThrottle:
                 self._dropped_pending.get(webhook_url, 0) + decision.dropped
             )
 
+    def record_retries(self, webhook_url: str, extra_requests: int) -> None:
+        """Charge a send's retry attempts to the webhook's budget.
+
+        ``check`` reserves one slot per notification, but a send retries up
+        to four times, so during a Discord incident a budget of thirty
+        notifications a minute would otherwise permit a hundred and twenty
+        requests. Bounding the request rate is what the budget is for, so
+        the attempts beyond the first are charged here once the send is
+        done and their number is known.
+
+        They are timestamped with the send that made them, which keeps the
+        list ordered for ``_has_budget``.
+        """
+        if extra_requests <= 0:
+            return
+        sends = self._sends.setdefault(webhook_url, [])
+        at = sends[-1] if sends else self._clock()
+        sends.extend([at] * extra_requests)
+
+    def _next_slot(self, webhook_url: str, now: float) -> float:
+        """When the next send on this webhook may go out.
+
+        Sends are spaced by MIN_SEND_SPACING_SECONDS, measured from the
+        last slot handed out rather than from the last send that actually
+        happened, so a batch arriving in one instant is spread rather than
+        all being told to go now.
+        """
+        sends = self._sends.get(webhook_url)
+        if not sends:
+            return now
+        return max(now, sends[-1] + MIN_SEND_SPACING_SECONDS)
+
     def _has_budget(self, webhook_url: str, now: float, max_per_minute: int) -> bool:
         """True when a send now stays inside the sliding-window budget."""
         cutoff = now - _WINDOW_SECONDS
         sends = self._sends.get(webhook_url)
         if not sends:
             return True
-        # Sends are appended in order, so dropping the stale head suffices.
-        # The list never exceeds the budget, so this stays cheap.
+        # Slots are appended in order -- scheduled times from _next_slot,
+        # retries timestamped with the send they belong to -- so dropping
+        # the stale head suffices. Retries can push the list past the
+        # budget, which is the point: they are requests too.
         while sends and sends[0] <= cutoff:
             sends.pop(0)
         return len(sends) < max_per_minute
@@ -214,23 +296,49 @@ class DiscordThrottle:
         Each window is judged against its own length, not the length of
         whichever notification happens to be sending. Windows holding a
         suppression count are kept until that count is delivered. Beyond a
-        hard cap the oldest are discarded regardless, so a pathological
-        spread of distinct notifications cannot grow the table without
-        limit.
+        hard cap they are discarded regardless, so a pathological spread of
+        distinct notifications cannot grow the table without limit.
+
+        Expiry runs on every send, including once the table is full. It
+        used to be skipped at the cap, which pinned the table there for
+        good: an expired, empty window was never reclaimed, and each send
+        evicted one live entry to make room.
+
+        Eviction order matters. Windows with nothing to report go first,
+        oldest first among them, and only then windows still holding a
+        count -- which is the opposite of oldest-first, because the oldest
+        window is the long dedup window most likely to be holding the
+        largest count. Dropping a count loses the "N further occurrences
+        suppressed" note for good, so the few that are dropped are logged.
         """
-        if len(self._windows) < MAX_TRACKED_SIGNATURES:
-            expired = [
-                key
-                for key, window in self._windows.items()
-                if window.suppressed == 0 and now - window.opened_at >= window.length
-            ]
-            for key in expired:
-                del self._windows[key]
+        expired = [
+            key
+            for key, window in self._windows.items()
+            if window.suppressed == 0 and now - window.opened_at >= window.length
+        ]
+        for key in expired:
+            del self._windows[key]
+
+        # Leave room for the window the caller is about to open.
+        overflow = len(self._windows) - (MAX_TRACKED_SIGNATURES - 1)
+        if overflow <= 0:
             return
 
-        ordered = sorted(self._windows.items(), key=lambda item: item[1].opened_at)
-        for key, _ in ordered[: len(self._windows) - MAX_TRACKED_SIGNATURES + 1]:
+        ordered = sorted(
+            self._windows.items(),
+            key=lambda item: (item[1].suppressed > 0, item[1].opened_at),
+        )
+        lost = 0
+        for key, window in ordered[:overflow]:
+            lost += window.suppressed
             del self._windows[key]
+        if lost:
+            logger.warning(
+                "Discord throttle is tracking %d signatures; discarded %d "
+                "suppressed occurrence(s) that will not be reported",
+                MAX_TRACKED_SIGNATURES,
+                lost,
+            )
 
     def reset(self) -> None:
         """Clear all throttle state. Intended for use in tests."""

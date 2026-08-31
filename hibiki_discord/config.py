@@ -9,15 +9,16 @@ _notifications: dict = {}
 # Seconds during which identical notifications collapse into one send.
 # Off by default, unlike hibiki-logger, which dedups at 300 seconds: there
 # a repeat is the same fault firing again, whereas a repeated business
-# notification is usually a second real event. Email anonymization makes
-# this sharper -- two different signups both render as "j***@example.com",
-# so dedup would collapse two customers into one message. Enable it per
+# notification is usually a second real event -- two signups a second
+# apart are two customers, not one message sent twice. Enable it per
 # notification type, or globally with HIBIKI_DISCORD_DEDUP_WINDOW, for
 # types where a repeat really is a repeat.
 DEFAULT_DEDUP_WINDOW = 0
 
-# Webhook send budget over a sliding 60 second window. Discord allows
-# roughly 5 requests per 2 seconds; the default sits below that.
+# Webhook send budget over a sliding 60 second window. This bounds the
+# average only; Discord's roughly 5 requests per 2 seconds is a limit on
+# the instant, which hibiki_discord.throttle bounds separately by pacing
+# sends that would otherwise leave together.
 DEFAULT_MAX_PER_MINUTE = 30
 
 

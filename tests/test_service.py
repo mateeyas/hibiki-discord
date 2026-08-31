@@ -3,6 +3,7 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
+import hibiki_discord.service as service_module
 import hibiki_discord.throttle as throttle_module
 from hibiki_discord.config import load_config_from_dict, reset
 from hibiki_discord.service import send, send_notification, anonymize_email, fire_notification
@@ -14,6 +15,19 @@ def clean_config():
     reset()
     yield
     reset()
+
+
+@pytest.fixture(autouse=True)
+def instant_pacing():
+    """Neutralize burst pacing, and record what it asked to wait.
+
+    Pacing is a real wait on the send path, so without this a test sending
+    a burst spends its wall clock asleep. Tests that care about the wait
+    assert on the yielded mock; the rest just run fast. Retry backoff is
+    left alone -- those tests patch `asyncio.sleep` themselves, narrowly.
+    """
+    with patch("hibiki_discord.service._pace", new_callable=AsyncMock) as pace:
+        yield pace
 
 
 class TestAnonymizeEmail:
@@ -41,6 +55,9 @@ class TestAnonymizeEmail:
 
     def test_single_char_local(self):
         assert anonymize_email("a@b.com") == "a***@b.com"
+
+    def test_empty_local_part(self):
+        assert anonymize_email("@example.com") == "@example.com"
 
 
 class TestSend:
@@ -180,7 +197,7 @@ class TestSendNotification:
             assert result is True
             call_kwargs = mock_send.call_args[1]
             assert call_kwargs["username"] == "Signup Bot"
-            assert "u***@example.com" in call_kwargs["message"]
+            assert "user@example.com" in call_kwargs["message"]
 
     @pytest.mark.asyncio
     async def test_template_variable_missing_raises(self, monkeypatch):
@@ -194,24 +211,85 @@ class TestSendNotification:
         with pytest.raises(ValueError, match="Missing template variable"):
             await send_notification("test")
 
+
+class TestFireNotificationTaskRetention:
     @pytest.mark.asyncio
-    async def test_email_anonymization_in_vars(self, monkeypatch):
+    async def test_the_task_is_retained_until_it_finishes(self, monkeypatch):
+        """asyncio holds only a weak reference to a running task.
+
+        A caller that takes fire_notification at its word and ignores the
+        task must not have the send collected out from under it mid-flight.
+        """
+        monkeypatch.setenv("WEBHOOK", "https://discord.com/api/webhooks/test")
+        configure()
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_send(**kwargs):
+            started.set()
+            await release.wait()
+            return True
+
+        with patch("hibiki_discord.service.send", new=slow_send):
+            fire_notification("signup", email="user@example.com")
+            await started.wait()
+
+            # The caller kept no reference; the package must hold one.
+            assert len(service_module._pending_tasks) == 1
+
+            release.set()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        assert service_module._pending_tasks == set()
+
+
+class TestAnonymizationIsNeverAutomatic:
+    """Ported from hibiki-js `test/service.test.ts`, same case names.
+
+    A magic substring match on argument names, applied to every
+    notification type, is wrong for a general-purpose library. The caller
+    decides what to redact.
+    """
+
+    @staticmethod
+    def configure(monkeypatch):
         monkeypatch.setenv("WEBHOOK", "https://discord.com/api/webhooks/test")
         load_config_from_dict({
-            "test": {
+            "signup": {
                 "webhook_url_env": "WEBHOOK",
-                "message_template": "User: {user_email}",
+                "message_template": "New user: {email}",
             }
         })
+
+    @pytest.mark.asyncio
+    async def test_sends_the_real_address_by_default(self, monkeypatch):
+        self.configure(monkeypatch)
 
         with patch(
             "hibiki_discord.service.send",
             new_callable=AsyncMock,
             return_value=True,
         ) as mock_send:
-            await send_notification("test", user_email="john@example.com")
-            sent_message = mock_send.call_args[1]["message"]
-            assert "j***@example.com" in sent_message
+            await send_notification("signup", email="jane@corp.com")
+
+        assert mock_send.call_args[1]["message"] == "New user: jane@corp.com"
+
+    @pytest.mark.asyncio
+    async def test_redacts_only_when_the_caller_asks(self, monkeypatch):
+        self.configure(monkeypatch)
+
+        with patch(
+            "hibiki_discord.service.send",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as mock_send:
+            await send_notification(
+                "signup", email=anonymize_email("jane@corp.com")
+            )
+
+        assert mock_send.call_args[1]["message"] == "New user: j***@corp.com"
 
 
 class TestFireNotification:
@@ -447,10 +525,10 @@ class TestNotificationThrottling:
 
     @pytest.mark.asyncio
     async def test_dedup_is_off_by_default(self, monkeypatch):
-        """Anonymization renders distinct signups identically.
+        """A repeated business notification is usually a second real event.
 
-        `alice@x.com` and `amir@x.com` both become `a***@x.com`, so dedup
-        on by default would collapse two customers into one message.
+        Two signups a second apart are two customers, not one message sent
+        twice, so nothing collapses them unless the caller asks for it.
         """
         monkeypatch.setenv("WEBHOOK", "https://discord.com/api/webhooks/test")
         configure()
@@ -508,7 +586,7 @@ class TestNotificationThrottling:
         ) as mock_send:
             await send_notification("signup", email="user@example.com")
 
-        assert mock_send.call_args[1]["message"] == "New user: u***@example.com"
+        assert mock_send.call_args[1]["message"] == "New user: user@example.com"
 
     @pytest.mark.asyncio
     async def test_failed_send_does_not_suppress_the_next(self, monkeypatch):
@@ -590,7 +668,7 @@ class TestNotificationEmbeds:
             await send_notification("signup", email="user@example.com")
 
         payload = session.post.call_args[1]["json"]
-        assert payload["content"] == "New user: u***@example.com"
+        assert payload["content"] == "New user: user@example.com"
         assert "embeds" not in payload
 
     @pytest.mark.asyncio
@@ -604,7 +682,7 @@ class TestNotificationEmbeds:
 
         payload = session.post.call_args[1]["json"]
         embed = payload["embeds"][0]
-        assert embed["description"] == "New user: u***@example.com"
+        assert embed["description"] == "New user: user@example.com"
         assert embed["title"] == "Signup"
         assert embed["color"] == 0x5865F2
         assert "content" not in payload
@@ -653,8 +731,191 @@ class TestNotificationEmbeds:
 
         assert result is True
         payload = session.post.call_args[1]["json"]
-        assert payload["content"] == "New user: u***@example.com"
+        assert payload["content"] == "New user: user@example.com"
         assert "embeds" not in payload
+
+
+class TestBurstPacing:
+    """The budget bounds the average; Discord's limit is on the instant."""
+
+    @pytest.mark.asyncio
+    async def test_a_burst_is_spaced_not_sent_at_once(self, monkeypatch, instant_pacing):
+        monkeypatch.setenv("WEBHOOK", "https://discord.com/api/webhooks/test")
+        configure(message_template="Signup {n}")
+        install_clock()
+
+        with patch(
+            "hibiki_discord.service.send", new_callable=AsyncMock, return_value=True
+        ) as mock_send:
+            for i in range(5):
+                assert await send_notification("signup", n=i) is True
+
+        # Nothing is dropped -- all five send, each a little after the last.
+        assert mock_send.call_count == 5
+        waits = [call[0][0] for call in instant_pacing.await_args_list]
+        assert waits == [0.5, 1.0, 1.5, 2.0]
+
+    @pytest.mark.asyncio
+    async def test_the_first_send_is_not_delayed(self, monkeypatch, instant_pacing):
+        monkeypatch.setenv("WEBHOOK", "https://discord.com/api/webhooks/test")
+        configure()
+        install_clock()
+
+        with patch(
+            "hibiki_discord.service.send", new_callable=AsyncMock, return_value=True
+        ):
+            await send_notification("signup", email="user@example.com")
+
+        instant_pacing.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_spaced_out_caller_is_never_paced(self, monkeypatch, instant_pacing):
+        monkeypatch.setenv("WEBHOOK", "https://discord.com/api/webhooks/test")
+        configure(message_template="Signup {n}")
+        clock = install_clock()
+
+        with patch(
+            "hibiki_discord.service.send", new_callable=AsyncMock, return_value=True
+        ):
+            for i in range(5):
+                await send_notification("signup", n=i)
+                clock.advance(2)
+
+        instant_pacing.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pacing_beyond_the_cap_sheds_instead_of_holding(self, monkeypatch):
+        """Waiting longer than the budget window is worse than shedding."""
+        monkeypatch.setenv("WEBHOOK", "https://discord.com/api/webhooks/test")
+        configure(message_template="Signup {n}", max_per_minute=1000)
+        install_clock()
+
+        sent = 0
+        with patch(
+            "hibiki_discord.service.send", new_callable=AsyncMock, return_value=True
+        ):
+            for i in range(400):
+                if await send_notification("signup", n=i):
+                    sent += 1
+
+        # 60s of pacing at 0.5s spacing, so the queue never runs deeper
+        # than a minute even though the budget would allow far more.
+        assert sent == 121
+        assert throttle_module.get_throttle()._dropped_pending[
+            "https://discord.com/api/webhooks/test"
+        ] == 279
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_pacing_wait_rolls_the_window_back(self, monkeypatch):
+        """A send cancelled while waiting its turn never reached Discord.
+
+        Only a send that queues behind another is paced, so this needs a
+        second notification type holding the slot ahead of it.
+        """
+        monkeypatch.setenv("WEBHOOK", "https://discord.com/api/webhooks/test")
+        load_config_from_dict({
+            "warmup": {
+                "webhook_url_env": "WEBHOOK",
+                "message_template": "Warmup",
+            },
+            "signup": {
+                "webhook_url_env": "WEBHOOK",
+                "message_template": "Processor unreachable",
+                "dedup_window": 300,
+            },
+        })
+        install_clock()
+
+        with patch(
+            "hibiki_discord.service.send", new_callable=AsyncMock, return_value=True
+        ) as mock_send:
+            await send_notification("warmup")
+
+            with patch(
+                "hibiki_discord.service._pace",
+                side_effect=asyncio.CancelledError,
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await send_notification("signup")
+
+            # The cancelled send must not leave a window behind that
+            # silences the next occurrence for the next 300 seconds.
+            assert await send_notification("signup") is True
+
+        assert [c[1]["message"] for c in mock_send.call_args_list] == [
+            "Warmup",
+            "Processor unreachable",
+        ]
+
+
+class TestRetriesAreCharged:
+    @pytest.mark.asyncio
+    async def test_retries_count_against_the_send_budget(self, monkeypatch):
+        """One notification retried four times costs four slots, not one."""
+        monkeypatch.setenv("WEBHOOK", "https://discord.com/api/webhooks/test")
+        configure(message_template="Signup {n}", max_per_minute=4)
+        install_clock()
+        # 429 throughout, so every send exhausts its four attempts.
+        patcher, session = webhook_mock([429], headers={"Retry-After": "0.1"})
+
+        with patcher, patch(
+            "hibiki_discord.service.asyncio.sleep", new_callable=AsyncMock
+        ):
+            first = await send_notification("signup", n=1)
+            second = await send_notification("signup", n=2)
+
+        assert first is False
+        # The first notification's four requests consumed the whole budget,
+        # so the second is shed before it can add four more.
+        assert second is False
+        assert session.post.call_count == 4
+
+    @pytest.mark.asyncio
+    async def test_a_send_that_lands_first_time_costs_one_slot(self, monkeypatch):
+        monkeypatch.setenv("WEBHOOK", "https://discord.com/api/webhooks/test")
+        configure(message_template="Signup {n}", max_per_minute=4)
+        install_clock()
+        patcher, session = webhook_mock([204])
+
+        with patcher:
+            for i in range(4):
+                assert await send_notification("signup", n=i) is True
+
+        assert session.post.call_count == 4
+
+
+class TestMentionSuppression:
+    @pytest.mark.asyncio
+    async def test_payload_suppresses_mentions(self, monkeypatch):
+        """A user-controlled value must not be able to ping the channel.
+
+        Template values are caller-supplied and often user-controlled, so a
+        display name or email of "@everyone" would otherwise ping everyone
+        on every notification.
+        """
+        monkeypatch.setenv("WEBHOOK", "https://discord.com/api/webhooks/test")
+        configure()
+        patcher, session = webhook_mock([204])
+
+        with patcher:
+            await send_notification("signup", email="@everyone")
+
+        payload = session.post.call_args[1]["json"]
+        assert payload["allowed_mentions"] == {"parse": []}
+        # The text is untouched; Discord is told not to resolve it.
+        assert payload["content"] == "New user: @everyone"
+
+    @pytest.mark.asyncio
+    async def test_low_level_send_suppresses_mentions(self):
+        patcher, session = webhook_mock([204])
+
+        with patcher:
+            await send(
+                webhook_url="https://discord.com/api/webhooks/test",
+                message="@here deploy finished",
+            )
+
+        assert session.post.call_args[1]["json"]["allowed_mentions"] == {"parse": []}
 
 
 class TestThrottleRollback:
